@@ -1,3 +1,6 @@
+#define CMD_DRIVE 0
+#define CMD_DRIVE_W_ACCEL 1
+
 #include "ros/ros.h"
 #include "std_msgs/String.h"
 #include "trajectory_msgs/JointTrajectory.h"
@@ -9,16 +12,20 @@
 #include <math.h>
 
 using namespace std;
+
+void drive_motor(int fd, struct mapping m, double velocity);
+void drive_motor_with_acceleration(int fd, struct mapping m, double velocity, double acceleration);
 void read_pid(unsigned char address);
 void set_pid_constants(unsigned char address, unsigned char cmd, int qpps, int p, int i , int d);
-int tss_usb_open( const char *port );
+int open_serial_port( const char *port );
 int send_cmd( const int fd, const unsigned char *data, const size_t num_bytes );
 int read_data( const int fd, unsigned char *data, size_t num_bytes );
 unsigned char mode_to_address(int mode);
 void joint_trajectory_callback(const trajectory_msgs::JointTrajectoryPtr &msg);
 unsigned char get_address(string name);
-unsigned char get_cmd(int channel);
+unsigned char get_cmd(int cmd_type,int channel);
 int get_pps(double vel);
+int get_mapping(string name);
 
 //Channel information needed in the joint_trajectory_callback
 struct mapping
@@ -31,6 +38,7 @@ struct mapping
 	//the motor controller channel, 1 or 2
 	//i.e. left or right for a wheeled robot
 	int channel;
+	double vel;
 };
 
 vector<mapping> address_map;
@@ -42,80 +50,103 @@ void joint_trajectory_callback(const trajectory_msgs::JointTrajectoryPtr &msg)
 	//Joint Trajectory Messages have a vector of String - names
 	//and a vectory of JointTrajectoryPoint - points
 	//These should have a 1-1 correspondance
-	
-	//The address (motor controller) to send the command to
-	unsigned char address;
-	//The command to send. 35 for driver M1 with signed speed, 36 for M2
-	//speed is in quad pulses per second
-	unsigned char cmd;
-	unsigned char send_str[100];
-
-	//the four byte speed
-	unsigned char speed[4];
+	struct mapping m;
 	for(int i = 0; i < msg->joint_names.size(); i++)
 	{		
-		//Match the name to a controller - which motor controller to drive
-		address = get_address(msg->joint_names[i]);
-
-		//Select cmd - which channel to drive
-		cmd = get_cmd(address_map[i].channel);
-
-		//Build the velocity command - how fast (rad/s)
-		double vel = msg->points[0].velocities[i];
-		int pulses_per_second = get_pps(vel);
-		int checksum = 0;
-
-		send_str[0] = address;
-		checksum += address;
-		ROS_INFO("byte[0]: %d\n",send_str[0]);
-
-		send_str[1] = cmd;
-		checksum += cmd;
-		ROS_INFO("byte[1]: %d\n",send_str[1]);
-		
-		//Set the acceleration to lots
-		long acceleration = 0xFFFFFFFF; //pulses/s/s probably
-		
-		/*send_str[2] = (acceleration >> 24) & 0xFF;
-		checksum += send_str[2];
-		ROS_INFO("byte[2]: %d\n",send_str[2]);
-
-		send_str[3] = (acceleration >> 16) & 0xFF;
-		checksum += send_str[3];
-		ROS_INFO("byte[3]: %d\n",send_str[3]);
-
-		send_str[4] = (acceleration >> 8) & 0xFF;
-		checksum += send_str[4];
-		ROS_INFO("byte[4]: %d\n",send_str[4]);
-
-		send_str[5] = acceleration & 0xFF;
-		checksum += send_str[5];
-		ROS_INFO("byte[5]: %d\n",send_str[5]);*/
-
-		send_str[2] = (pulses_per_second >> 24) & 0xFF;
-		checksum += send_str[2];
-		ROS_INFO("byte[2]: %d\n",send_str[2]);
-		
-		send_str[3] = (pulses_per_second >> 16) & 0xFF;
-		checksum += send_str[3];
-		ROS_INFO("byte[3]: %d\n",send_str[3]);
-		
-		send_str[4] = (pulses_per_second >> 8) & 0xFF;
-		checksum += send_str[4];
-		ROS_INFO("byte[4]: %d\n",send_str[4]);
-	
-		send_str[5] = pulses_per_second & 0xFF;
-		checksum += send_str[5];
-		ROS_INFO("byte[5]: %d\n",send_str[5]);
-
-		send_str[6] = checksum & 0x7F;
-		//set confirm packet bit
-		send_str[6] |= 0x80;
-		ROS_INFO("byte[6]: %d\n\n\n",send_str[6]);
-
-		send_cmd(fd,send_str,7);
-		tcflush(fd, TCIOFLUSH); 
+		//Match the joint name to one of our mappings
+		int index = get_mapping(msg->joint_names[i]);
+		if(-1 == index)
+		{
+			ROS_WARN("Unknown joint_name: %s",msg->joint_names[i].c_str());	
+			continue;
+		}
+		//set motor speeds for update in the main loop
+		address_map[index].vel = msg->points[0].velocities[i];
+		//set motor commands
+		//drive_motor_with_acceleration(fd,address_map[index],msg->points[0].velocities[i],5);
 	}
+}
+
+int get_mapping(string name)
+{
+	for(int i = 0; i < address_map.size(); i++)
+		if(name == address_map[i].label)
+			return i;
+	return -1;
+}
+
+void drive_motor_with_acceleration(int fd, struct mapping m, double velocity, double acceleration)
+{	
+	
+	unsigned char send_str[11];
+	int pps_speed = get_pps(velocity);
+	int pps_accel = get_pps(acceleration);
+	
+	int checksum = 0;
+
+	send_str[0] = get_address(m.label);
+	checksum +=   get_address(m.label);
+
+	send_str[1] = get_cmd(CMD_DRIVE_W_ACCEL,m.channel);
+	checksum +=   get_cmd(CMD_DRIVE_W_ACCEL,m.channel);
+	
+	send_str[2] = (pps_accel>>24) & 0xFF;
+	checksum +=   (pps_accel>>24) & 0xFF;
+	
+	send_str[3] = (pps_accel>>16) & 0xFF;
+	checksum +=   (pps_accel>>16) & 0xFF;
+
+	send_str[4] = (pps_accel>>8) & 0xFF;
+	checksum +=   (pps_accel>>8) & 0xFF;
+
+	send_str[5] = pps_accel & 0xFF;
+	checksum +=   pps_accel & 0xFF;
+	
+	send_str[6] = (pps_speed>>24) & 0xFF;
+	checksum +=   (pps_speed>>24) & 0xFF;
+	
+	send_str[7] = (pps_speed>>16) & 0xFF;
+	checksum +=   (pps_speed>>16) & 0xFF;
+
+	send_str[8] = (pps_speed>>8) & 0xFF;
+	checksum +=   (pps_speed>>8) & 0xFF;
+
+	send_str[9] = pps_speed & 0xFF;
+	checksum +=   pps_speed & 0xFF;
+
+	send_str[10] = checksum & 0x7F;
+	send_cmd(fd,send_str,11);
+	tcflush(fd, TCIOFLUSH); 
+}
+
+void drive_motor(int fd, struct mapping m, double velocity)
+{	
+	
+	unsigned char send_str[7];
+	int pps = get_pps(velocity);
+	int checksum = 0;
+
+	send_str[0] = get_address(m.label);
+	checksum +=   get_address(m.label);
+
+	send_str[1] = get_cmd(CMD_DRIVE,m.channel);
+	checksum +=   get_cmd(CMD_DRIVE,m.channel);
+	
+	send_str[2] = (pps>>24) & 0xFF;
+	checksum +=   (pps>>24) & 0xFF;
+	
+	send_str[3] = (pps>>16) & 0xFF;
+	checksum +=   (pps>>16) & 0xFF;
+
+	send_str[4] = (pps>>8) & 0xFF;
+	checksum +=   (pps>>8) & 0xFF;
+
+	send_str[5] = pps & 0xFF;
+	checksum +=   pps & 0xFF;
+
+	send_str[6] = checksum & 0x7F;
+	send_cmd(fd,send_str,7);
+	tcflush(fd, TCIOFLUSH); 
 }
 
 void read_pid(unsigned char address)
@@ -124,13 +155,13 @@ void read_pid(unsigned char address)
 	send_str[0] = address;
 	send_str[1] = 55;
 	send_cmd(fd,send_str,2);
-	//read_data(fd,send_str,17);
-	//ROS_INFO("Read PID: %d, %d, %d, %d\n",*((int*)send_str), *((int*)send_str+4),*((int*)send_str+8),*((int*)send_str+12));
+	read_data(fd,send_str,17);
+	ROS_INFO("Read PID: %d, %d, %d, %d\n",*((int*)send_str), *((int*)send_str+4),*((int*)send_str+8),*((int*)send_str+12));
 }
 
 void set_pid_constants(unsigned char address, unsigned char cmd, int qpps, int p, int i , int d)
 {
-	unsigned char send_str[100];
+	unsigned char send_str[19];
 	int checksum = 0;
 
 	send_str[0] = address;
@@ -176,7 +207,7 @@ void set_pid_constants(unsigned char address, unsigned char cmd, int qpps, int p
 
 	send_str[18] = (checksum&0x7F);
 	send_cmd(fd,send_str,19);
-	tcflush(fd, TCIOFLUSH); 		
+	tcflush(fd, TCIOFLUSH);
 }
 
 int get_pps(double vel)
@@ -206,13 +237,25 @@ unsigned char mode_to_address(int mode)
 	return 0x80 + (mode-7);
 }
 
-unsigned char get_cmd(int channel)
+unsigned char get_cmd(int cmd_type,int channel)
 {
+	int cmd;
 	if(channel == 1)
-		return 35;
+		cmd = 0;
 	else if(channel == 2)
-		return 36;
-	ROS_ERROR("orion_roboclaw_driver:\n\tget_cmd: Invalid channel:%d\n",channel);
+		cmd = 1;
+	else
+		ROS_ERROR("orion_roboclaw_driver:\n\tget_cmd: Invalid channel:%d\n",channel);
+
+	switch(cmd_type)
+	{
+		case CMD_DRIVE:
+			return cmd + 35;
+		break;
+		case CMD_DRIVE_W_ACCEL:
+			return cmd + 38;
+		break;
+	}
 	return 0;
 }
 
@@ -221,6 +264,9 @@ int main(int argc, char **argv)
 	ros::init(argc, argv, "orion_roboclaw_driver_node");
 	ros::NodeHandle n;
 	ros::NodeHandle nh_priv( "~" );
+	
+	//Publish commands at 50Hz
+	ros::Rate loop_rate(10);
 
 	//set up a subscriber to listen for joint_trajectory messages
 	ros::Subscriber joint_trajectory_sub = n.subscribe("cmd_joint_traj", 1, joint_trajectory_callback);
@@ -260,66 +306,50 @@ int main(int argc, char **argv)
 	}
 	
 	int count = 0;
-	fd = tss_usb_open("/dev/ttySAC0");
+	fd = open_serial_port("/dev/ttySAC0");
 	if(fd < 0)
-	{
-		ROS_ERROR("orion_roboclaw_driver: Failed to open port\n");
 		return 0;
-	}
-	set_pid_constants(128,28,44000,0xF0000,0xF0000,0x40000);
-	set_pid_constants(128,29,44000,0xF0000,0xF0000,0x40000);
-	set_pid_constants(129,28,44000,0xF0000,0xF0000,0x40000);
-	set_pid_constants(129,29,44000,0xF0000,0xF0000,0x40000);
+	//stop all the motors
+	for( int i = 0; i < address_map.size(); i++)
+	{
+		drive_motor(fd,address_map[i],0);
+	}	
+	set_pid_constants(128,28,44000,0x10000,0x8000,0x4000);
+	usleep(1000000);
+	set_pid_constants(128,29,44000,0x10000,0x8000,0x4000);
+	usleep(1000000);
+	set_pid_constants(129,28,44000,0x10000,0x8000,0x4000);
+	usleep(1000000);
+	set_pid_constants(129,29,44000,0x10000,0x8000,0x4000);
+	usleep(1000000);
 	//read_pid(128);
-	unsigned char send_str[1000];
-	send_str[0] = 129;
-	send_str[1] = 36;
-	send_str[2] = 0;
-	send_str[3] = 0;
-	send_str[4] = 0;
-	send_str[5] = 0;
-	send_str[6] = (129 + 36)&0x7F;
-	send_cmd(fd,send_str,7);
-	send_str[0] = 129;
-	send_str[1] = 35;
-	send_str[2] = 0;
-	send_str[3] = 0;
-	send_str[4] = 0;
-	send_str[5] = 0;
-	send_str[6] = (129 + 35)&0x7F;
-	send_cmd(fd,send_str,7);
-	send_str[0] = 128;
-	send_str[1] = 35;
-	send_str[2] = 0;
-	send_str[3] = 0;
-	send_str[4] = 0;
-	send_str[5] = 0;
-	send_str[6] = (128 + 35)&0x7F;
-	send_cmd(fd,send_str,7);
-	send_str[0] = 128;
-	send_str[1] = 36;
-	send_str[2] = 0;
-	send_str[3] = 0;
-	send_str[4] = 0;
-	send_str[5] = 0;
-	send_str[6] = (128 + 36)&0x7F;
-	send_cmd(fd,send_str,7);
 	//read_data(fd,send_str,5);
 	//ROS_INFO("%s\n",send_str);
 	
 	while (ros::ok())
 	{
+		loop_rate.sleep();
+		//Send current command
+		for(int i = 0; i < address_map.size(); i++)
+		{
+			drive_motor_with_acceleration(fd,address_map[i],address_map[i].vel,10);
+			usleep(10000);
+		}
+		
 		ros::spinOnce();
-		read_data(fd,send_str,1);
 	}
 	return 0;
+}
+
+void publish_command()
+{
+
 }
 
 
 int send_cmd( const int fd, const unsigned char *data, const size_t num_bytes )
 {
 	int bytes_sent = write( fd, data, num_bytes );
-	ROS_INFO("Sent %d bytes\n",bytes_sent);
 	if( bytes_sent < 0 )
 	{
 		ROS_INFO("Send error 1\n");
@@ -341,10 +371,12 @@ int send_cmd( const int fd, const unsigned char *data, const size_t num_bytes )
 
 int read_data( const int fd, unsigned char *data, size_t num_bytes )
 {
+	ROS_INFO("In read data");
 	int bytes_recv;
 	while( num_bytes )
 	{
 		bytes_recv = read( fd, data, num_bytes );
+		ROS_INFO("Received %d bytes",bytes_recv);
 		if( bytes_recv < 0 )
 			return -1;
 		if( bytes_recv == 0 )
@@ -358,13 +390,13 @@ int read_data( const int fd, unsigned char *data, size_t num_bytes )
 	return -1;
 }
 
-int tss_usb_open( const char *port )
+int open_serial_port( const char *port )
 {
 	/* Step 1: Make sure the device opens OK */
 	int fd = open( port, O_RDWR | O_NOCTTY | O_NDELAY );
 	if( fd < 0 )
 	{
-		ROS_INFO("Error 1\n");
+		ROS_ERROR("Failed to open port: %s",port);
 		return -1;
 	}
 
@@ -376,13 +408,13 @@ int tss_usb_open( const char *port )
 	if( cfsetispeed( &options, B38400 ) < 0 )
 	{
 		close( fd );
-		ROS_INFO("Error 2\n");
+		ROS_ERROR("Failed to set input baud rate for port: %s.",port);
 		return -1;
 	}
 	if( cfsetospeed( &options, B38400 ) < 0 )
 	{
 		close( fd );
-		ROS_INFO("Error 3\n");
+		ROS_ERROR("Failed to set output baud rate for port: %s.",port);
 		return -1;
 	}
 	options.c_cflag &= ~HUPCL;
@@ -393,7 +425,6 @@ int tss_usb_open( const char *port )
 	if( ret_val < 0 )
 	{
 		ROS_INFO("Failed with error %s\n",strerror(errno));
-		ROS_INFO("Error 4: %d %d\n",ret_val,errno);
 		close( fd );
 		return -1;
 	}
