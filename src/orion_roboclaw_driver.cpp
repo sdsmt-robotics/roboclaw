@@ -1,5 +1,6 @@
 #define CMD_DRIVE 0
 #define CMD_DRIVE_W_ACCEL 1
+#define CMD_DRIVE_PWM 2
 
 #include "ros/ros.h"
 #include "std_msgs/String.h"
@@ -26,6 +27,7 @@ unsigned char get_address(string name);
 unsigned char get_cmd(int cmd_type,int channel);
 int get_pps(double vel);
 int get_mapping(string name);
+void read_firmware_version(int fd);
 
 //Channel information needed in the joint_trajectory_callback
 struct mapping
@@ -62,8 +64,6 @@ void joint_trajectory_callback(const trajectory_msgs::JointTrajectoryPtr &msg)
 		}
 		//set motor speeds for update in the main loop
 		address_map[index].vel = msg->points[0].velocities[i];
-		//set motor commands
-		//drive_motor_with_acceleration(fd,address_map[index],msg->points[0].velocities[i],5);
 	}
 }
 
@@ -155,6 +155,7 @@ void read_pid(unsigned char address)
 	send_str[0] = address;
 	send_str[1] = 55;
 	send_cmd(fd,send_str,2);
+	usleep(1000);
 	read_data(fd,send_str,17);
 	ROS_INFO("Read PID: %d, %d, %d, %d\n",*((int*)send_str), *((int*)send_str+4),*((int*)send_str+8),*((int*)send_str+12));
 }
@@ -169,13 +170,13 @@ void set_pid_constants(unsigned char address, unsigned char cmd, int qpps, int p
 	send_str[1] = cmd;
 	checksum += send_str[1];
 	
-	send_str[2] = (qpps >> 24) & 0xFF;
+	send_str[2] = (d >> 24) & 0xFF;
 	checksum += send_str[2];
-	send_str[3] = (qpps >> 16) & 0xFF;
+	send_str[3] = (d >> 16) & 0xFF;
 	checksum += send_str[3];
-	send_str[4] = (qpps >> 8 ) & 0xFF;
+	send_str[4] = (d >> 8 ) & 0xFF;
 	checksum += send_str[4];
-	send_str[5] = qpps & 0xFF;
+	send_str[5] = d & 0xFF;
 	checksum += send_str[5];
 	
 	send_str[6] = (p >> 24) & 0xFF;
@@ -196,13 +197,13 @@ void set_pid_constants(unsigned char address, unsigned char cmd, int qpps, int p
 	send_str[13] = i & 0xFF;
 	checksum += send_str[13];
 	
-	send_str[14] = (d >> 24) & 0xFF;
+	send_str[14] = (qpps >> 24) & 0xFF;
 	checksum += send_str[14];
-	send_str[15] = (d >> 16) & 0xFF;
+	send_str[15] = (qpps >> 16) & 0xFF;
 	checksum += send_str[15];
-	send_str[16] = (d >> 8 ) & 0xFF;
+	send_str[16] = (qpps >> 8 ) & 0xFF;
 	checksum += send_str[16];
-	send_str[17] = d & 0xFF;
+	send_str[17] = qpps & 0xFF;
 	checksum += send_str[17];
 
 	send_str[18] = (checksum&0x7F);
@@ -215,7 +216,9 @@ int get_pps(double vel)
 	//vel is in rad/s
 	//We know we have 420 ticks per rev*4 pulses per tick
 	//2*Pi rads in a rev
-	return (vel*420*4)/(2*M_PI);
+	int pps = (vel*420*4)/(2*M_PI);
+	ROS_INFO("PPS: %d",pps);
+	return pps;
 }
 
 unsigned char get_address(string name)
@@ -255,12 +258,14 @@ unsigned char get_cmd(int cmd_type,int channel)
 		case CMD_DRIVE_W_ACCEL:
 			return cmd + 38;
 		break;
+		//case CMD_DRIVE_PWM:
 	}
 	return 0;
 }
 
 int main(int argc, char **argv)
 {
+	char port_name[100] = "/dev/ttySAC0";
 	ros::init(argc, argv, "orion_roboclaw_driver_node");
 	ros::NodeHandle n;
 	ros::NodeHandle nh_priv( "~" );
@@ -271,6 +276,11 @@ int main(int argc, char **argv)
 	//set up a subscriber to listen for joint_trajectory messages
 	ros::Subscriber joint_trajectory_sub = n.subscribe("cmd_joint_traj", 1, joint_trajectory_callback);
 
+	//check for non-detault port name
+	if(nh_priv.hasParam("port"))
+	{
+
+	}
 	//Check for non-default channel mode
 	if(nh_priv.hasParam("channel_mapping"))
 	{
@@ -306,39 +316,48 @@ int main(int argc, char **argv)
 	}
 	
 	int count = 0;
-	fd = open_serial_port("/dev/ttySAC0");
+	fd = open_serial_port(port_name);
 	if(fd < 0)
 		return 0;
 	//stop all the motors
 	for( int i = 0; i < address_map.size(); i++)
-	{
 		drive_motor(fd,address_map[i],0);
-	}	
-	set_pid_constants(128,28,44000,0x10000,0x8000,0x4000);
-	usleep(1000000);
-	set_pid_constants(128,29,44000,0x10000,0x8000,0x4000);
-	usleep(1000000);
-	set_pid_constants(129,28,44000,0x10000,0x8000,0x4000);
-	usleep(1000000);
-	set_pid_constants(129,29,44000,0x10000,0x8000,0x4000);
-	usleep(1000000);
-	//read_pid(128);
-	//read_data(fd,send_str,5);
-	//ROS_INFO("%s\n",send_str);
+
+	//this needs to be replaced with params, but these defaults 
+	//work for mecanum	
+	set_pid_constants(129,29,2400,0x100,0x10,0x0);
+	usleep(10000);
+	set_pid_constants(128,28,2400,0x100,0x10,0x0);
+	usleep(10000);
+	set_pid_constants(128,29,2400,0x100,0x10,0x0);
+	usleep(10000);
+	set_pid_constants(129,28,2400,0x100,0x10,0x0);
+	usleep(10000);
 	
 	while (ros::ok())
 	{
 		loop_rate.sleep();
 		//Send current command
 		for(int i = 0; i < address_map.size(); i++)
-		{
-			drive_motor_with_acceleration(fd,address_map[i],address_map[i].vel,10);
-			usleep(10000);
-		}
-		
+			drive_motor(fd,address_map[i],address_map[i].vel);
 		ros::spinOnce();
 	}
+	//stop all the motors
+	for( int i = 0; i < address_map.size(); i++)
+		drive_motor(fd,address_map[i],0);
 	return 0;
+}
+
+void read_firmware_version(int fd)
+{
+	unsigned char str[100];
+	str[0] = 129;
+	str[1] = 21;
+	send_cmd(fd,str,2);
+	//Wait 1ms for response
+	usleep(1000);
+	read_data(fd,str,32);
+	ROS_INFO("Version: %s",str);
 }
 
 void publish_command()
@@ -371,21 +390,21 @@ int send_cmd( const int fd, const unsigned char *data, const size_t num_bytes )
 
 int read_data( const int fd, unsigned char *data, size_t num_bytes )
 {
-	ROS_INFO("In read data");
+//	ROS_INFO("In read data");
 	int bytes_recv;
 	while( num_bytes )
 	{
 		bytes_recv = read( fd, data, num_bytes );
-		ROS_INFO("Received %d bytes",bytes_recv);
+//		ROS_INFO("Received %d bytes",bytes_recv);
 		if( bytes_recv < 0 )
 			return -1;
 		if( bytes_recv == 0 )
 			return -1;
 		num_bytes -= bytes_recv;
-		for(int i = 0; i < bytes_recv; i++)
-		{
-			ROS_INFO("Received byte: %d",data[i]);
-		}
+//		for(int i = 0; i < bytes_recv; i++)
+//		{
+//			ROS_INFO("Received byte: %d",data[i]);
+//		}
 	}
 	return -1;
 }
