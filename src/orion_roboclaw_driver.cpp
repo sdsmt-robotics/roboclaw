@@ -1,50 +1,18 @@
-#define CMD_DRIVE 0
-#define CMD_DRIVE_W_ACCEL 1
-#define CMD_DRIVE_PWM 2
+/* File: orion_roboclaw_driver.cpp
+ * This is a driver for the orion Roboclaw motor controller. Up to 8
+ * roboclaw controllers can be controlled via this driver. This driver
+ * exposes the following parameters
+ *
+ * 
+ */
 
-#include "ros/ros.h"
-#include "std_msgs/String.h"
-#include "trajectory_msgs/JointTrajectory.h"
-#include <sstream>
-#include <stdio.h>
-#include <fcntl.h>
-#include <termios.h>
-#include <vector>
-#include <math.h>
+#include "orion_roboclaw_driver/orion_roboclaw_driver.hpp"
 
-using namespace std;
 
-void drive_motor(int fd, struct mapping m, double velocity);
-void drive_motor_with_acceleration(int fd, struct mapping m, double velocity, double acceleration);
-void read_pid(unsigned char address);
-void set_pid_constants(unsigned char address, unsigned char cmd, int qpps, int p, int i , int d);
-int open_serial_port( const char *port );
-int send_cmd( const int fd, const unsigned char *data, const size_t num_bytes );
-int read_data( const int fd, unsigned char *data, size_t num_bytes );
-unsigned char mode_to_address(int mode);
-void joint_trajectory_callback(const trajectory_msgs::JointTrajectoryPtr &msg);
-unsigned char get_address(string name);
-unsigned char get_cmd(int cmd_type,int channel);
-int get_pps(double vel);
-int get_mapping(string name);
-void read_firmware_version(int fd);
-
-//Channel information needed in the joint_trajectory_callback
-struct mapping
-{
-	//Corresponds to the Mode in the roboclaw datasheet
-	//valid range 7-14
-	int mode;
-	//The user-readable name. i.e. left front wheel
-	string label;
-	//the motor controller channel, 1 or 2
-	//i.e. left or right for a wheeled robot
-	int channel;
-	double vel;
-};
-
+//GLOBAL VARIABLES*************************************************************
 vector<mapping> address_map;
 int fd;
+//*****************************************************************************
 
 //420 pulses per revolution for the current motors
 void joint_trajectory_callback(const trajectory_msgs::JointTrajectoryPtr &msg)
@@ -75,9 +43,8 @@ int get_mapping(string name)
 	return -1;
 }
 
-void drive_motor_with_acceleration(int fd, struct mapping m, double velocity, double acceleration)
+/*void drive_motor_with_acceleration(int fd, struct mapping m, double velocity, double acceleration)
 {	
-	
 	unsigned char send_str[11];
 	int pps_speed = get_pps(velocity);
 	int pps_accel = get_pps(acceleration);
@@ -117,20 +84,27 @@ void drive_motor_with_acceleration(int fd, struct mapping m, double velocity, do
 	send_str[10] = checksum & 0x7F;
 	send_cmd(fd,send_str,11);
 	tcflush(fd, TCIOFLUSH); 
-}
+}*/
 
 void drive_motor(int fd, struct mapping m, double velocity)
 {	
-	
 	unsigned char send_str[7];
 	int pps = get_pps(velocity);
 	int checksum = 0;
 
 	send_str[0] = get_address(m.label);
 	checksum +=   get_address(m.label);
-
-	send_str[1] = get_cmd(CMD_DRIVE,m.channel);
-	checksum +=   get_cmd(CMD_DRIVE,m.channel);
+	
+	if(1 == m.channel)
+	{
+		send_str[1] = CMD_DRIVE_M1_SIGNED_SPEED;
+		checksum +=   CMD_DRIVE_M1_SIGNED_SPEED;
+	}
+	else if(2 == m.channel)
+	{
+		send_str[1] = CMD_DRIVE_M2_SIGNED_SPEED;
+		checksum +=   CMD_DRIVE_M2_SIGNED_SPEED;
+	}
 	
 	send_str[2] = (pps>>24) & 0xFF;
 	checksum +=   (pps>>24) & 0xFF;
@@ -146,6 +120,7 @@ void drive_motor(int fd, struct mapping m, double velocity)
 
 	send_str[6] = checksum & 0x7F;
 	send_cmd(fd,send_str,7);
+
 	tcflush(fd, TCIOFLUSH); 
 }
 
@@ -211,6 +186,7 @@ void set_pid_constants(unsigned char address, unsigned char cmd, int qpps, int p
 	tcflush(fd, TCIOFLUSH);
 }
 
+//The number of encoder ticks per revolution may vary per motor
 int get_pps(double vel)
 {
 	//vel is in rad/s
@@ -240,7 +216,7 @@ unsigned char mode_to_address(int mode)
 	return 0x80 + (mode-7);
 }
 
-unsigned char get_cmd(int cmd_type,int channel)
+/*unsigned char get_cmd(int cmd_type,int channel)
 {
 	int cmd;
 	if(channel == 1)
@@ -261,11 +237,11 @@ unsigned char get_cmd(int cmd_type,int channel)
 		//case CMD_DRIVE_PWM:
 	}
 	return 0;
-}
+}*/
 
 int main(int argc, char **argv)
 {
-	char port_name[100] = "/dev/ttySAC0";
+	//char port_name[100] = "/dev/ttySAC0";
 	ros::init(argc, argv, "orion_roboclaw_driver_node");
 	ros::NodeHandle n;
 	ros::NodeHandle nh_priv( "~" );
@@ -276,47 +252,78 @@ int main(int argc, char **argv)
 	//set up a subscriber to listen for joint_trajectory messages
 	ros::Subscriber joint_trajectory_sub = n.subscribe("cmd_joint_traj", 1, joint_trajectory_callback);
 
+	std::string port;
 	//check for non-detault port name
-	if(nh_priv.hasParam("port"))
-	{
+	nh_priv.param("port",port,(const std::string)"/dev/ttySAC0");
 
+	//Thank you Matt Richard for this XmlRpcValue nonsense code. Never would have figured this
+	//out on my own
+	XmlRpc::XmlRpcValue name_list;
+	if( nh_priv.getParam("names", name_list ) )
+	{
+		ROS_ASSERT( name_list.getType( ) == XmlRpc::XmlRpcValue::TypeArray );
+
+		// Get names array
+		XmlRpcValueAccess names_array_access( name_list );
+		XmlRpc::XmlRpcValue::ValueArray names_array = names_array_access.getValueArray( );
+
+		// Create a new address_mapping for each name and hope they get filled out later
+		for( unsigned int i = 0; i < names_array.size( ); i++ )
+		{
+			mapping m;
+			m.label = static_cast<std::string>( names_array[i] );
+			m.mode = -1;
+			m.channel = -1;
+			address_map.push_back(m);
+		}
 	}
-	//Check for non-default channel mode
-	if(nh_priv.hasParam("channel_mapping"))
+	XmlRpc::XmlRpcValue mode_list;
+	if( nh_priv.getParam("modes", mode_list ) )
 	{
-			
-	}	
-	else
+		ROS_ASSERT( mode_list.getType( ) == XmlRpc::XmlRpcValue::TypeArray );
+
+		// Get modes array
+		XmlRpcValueAccess mode_array_access( mode_list );
+		XmlRpc::XmlRpcValue::ValueArray mode_array = mode_array_access.getValueArray( );
+
+		//first make sure we don't have more modes than we do mappings
+		if(mode_array.size() > address_map.size())
+			ROS_WARN("More modes than joint names detected. Excess will be ignored.");
+		if(mode_array.size() < address_map.size())
+		{
+			address_map.resize(mode_array.size());
+			ROS_WARN("Less modes than joint names detected. Extra joint names will be discarded.");
+		}
+		for( unsigned int i = 0; i < address_map.size( ); i++ )
+		{
+			address_map[i].mode = static_cast<int>( mode_array[i] );
+		}
+	}
+	XmlRpc::XmlRpcValue channel_list;
+	if( nh_priv.getParam("channels", channel_list ) )
 	{
-		mapping m;
+		ROS_ASSERT( channel_list.getType( ) == XmlRpc::XmlRpcValue::TypeArray );
+
+		// Get channel array
+		XmlRpcValueAccess channel_array_access( channel_list );
+		XmlRpc::XmlRpcValue::ValueArray channel_array = channel_array_access.getValueArray( );
 		
-		//Front left wheel
-		m.label = "front_left";
-		m.mode = 7;
-		m.channel = 1;
-		address_map.push_back(m);
-
-		//Front right wheel
-		m.label = "front_right";
-		m.mode = 7;
-		m.channel = 2;
-		address_map.push_back(m);
-
-		//back left wheel
-		m.label = "back_left";
-		m.mode = 8;
-		m.channel = 1;
-		address_map.push_back(m);
-
-		//back right wheel
-		m.label = "back_right";
-		m.mode = 8;
-		m.channel = 2;
-		address_map.push_back(m);
+		if(channel_array.size() > address_map.size())
+			ROS_WARN("More channels than joint names detected. Excess will be ignored.");
+		if(channel_array.size() < address_map.size())
+		{
+			address_map.resize(channel_array.size());
+			ROS_WARN("Less channels than joint names detected. Extra joint names will be discarded.");
+		}
+		// Parse the joint names and verify the joint exists
+		for( unsigned int i = 0; i < address_map.size( ); i++ )
+		{
+			address_map[i].channel = static_cast<int>( channel_array[i] );
+		}
 	}
 	
 	int count = 0;
-	fd = open_serial_port(port_name);
+	fd = open_serial_port(port.c_str());
 	if(fd < 0)
 		return 0;
 	//stop all the motors
