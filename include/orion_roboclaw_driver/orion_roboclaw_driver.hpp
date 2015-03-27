@@ -24,7 +24,13 @@ struct mapping
 	//the motor controller channel, 1 or 2
 	//i.e. left or right for a wheeled robot
 	int channel;
-	double vel;
+	int counts_per_rev;
+	double velocity;
+	double acceleration;
+	int p_gain;
+	int i_gain;
+	int d_gain;
+	int qpps;
 };
 
 //Drive Commands - same as documentation
@@ -102,10 +108,12 @@ enum roboclaw_commands
 
 
 //Function Definitions
-void drive_motor(int fd, struct mapping m, double velocity);
-void drive_motor_with_acceleration(int fd, struct mapping m, double velocity, double acceleration);
+void drive_motor(int fd, struct mapping m);
+void drive_motor_pwm(int fd, struct mapping m);
+void drive_motor_with_acceleration(int fd, struct mapping m);
 void read_pid(unsigned char address);
 void set_pid_constants(unsigned char address, unsigned char cmd, int qpps, int p, int i , int d);
+bool get_parameters(ros::NodeHandle nh_priv, std::string &port);
 int open_serial_port( const char *port );
 int send_cmd( const int fd, const unsigned char *data, const size_t num_bytes );
 int read_data( const int fd, unsigned char *data, size_t num_bytes );
@@ -113,7 +121,7 @@ unsigned char mode_to_address(int mode);
 void joint_trajectory_callback(const trajectory_msgs::JointTrajectoryPtr &msg);
 unsigned char get_address(string name);
 unsigned char get_cmd(int cmd_type,int channel);
-int get_pps(double vel);
+int get_pps(double vel, int counts_per_rev);
 int get_mapping(string name);
 void read_firmware_version(int fd);
 

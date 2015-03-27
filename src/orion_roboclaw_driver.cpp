@@ -2,8 +2,15 @@
  * This is a driver for the orion Roboclaw motor controller. Up to 8
  * roboclaw controllers can be controlled via this driver. This driver
  * exposes the following parameters
+ * 	counts_per_rev - the number of encoder counts per revolution of the
+ * 		wheel
+ *	port - which serial port the driver should write to
  *
- * 
+ *	For Each Channel: (see mecanum.config for an example)
+ *		joint names for each channel of each motor controller
+ *		modes - for each joint name, which mode the motor controller
+ *			is in. Only packet serial modes currently supported.
+ *		channels - for each joint name, which channel the motor is on
  */
 
 #include "orion_roboclaw_driver/orion_roboclaw_driver.hpp"
@@ -12,15 +19,17 @@
 //GLOBAL VARIABLES*************************************************************
 vector<mapping> address_map;
 int fd;
+int counts_per_rev;
+bool closed_loop_mode;
 //*****************************************************************************
 
-//420 pulses per revolution for the current motors
 void joint_trajectory_callback(const trajectory_msgs::JointTrajectoryPtr &msg)
 {
 	//Joint Trajectory Messages have a vector of String - names
 	//and a vectory of JointTrajectoryPoint - points
 	//These should have a 1-1 correspondance
 	struct mapping m;
+	//First, collect all the new velocities
 	for(int i = 0; i < msg->joint_names.size(); i++)
 	{		
 		//Match the joint name to one of our mappings
@@ -30,9 +39,15 @@ void joint_trajectory_callback(const trajectory_msgs::JointTrajectoryPtr &msg)
 			ROS_WARN("Unknown joint_name: %s",msg->joint_names[i].c_str());	
 			continue;
 		}
-		//set motor speeds for update in the main loop
-		address_map[index].vel = msg->points[0].velocities[i];
+		address_map[index].velocity = msg->points[0].velocities[i];
+		//address_map[index].acceleration = msg->points[0].accelerations[i];
 	}
+	//Then send the commands all at once
+	for(int i = 0; i < address_map.size(); i++)
+		if(closed_loop_mode)
+			drive_motor(fd,address_map[i]);
+		else
+			drive_motor_pwm(fd,address_map[i]);
 }
 
 int get_mapping(string name)
@@ -86,10 +101,44 @@ int get_mapping(string name)
 	tcflush(fd, TCIOFLUSH); 
 }*/
 
-void drive_motor(int fd, struct mapping m, double velocity)
+void drive_motor_pwm(int fd, struct mapping m)
+{
+	unsigned char send_str[4];
+	int checksum = 0;
+
+	//Map -1.0-1.0 to 0-127.
+	// Take the ceil of the mapping because 0 needs to land on 64, not 63.
+	int pwm = ((m.velocity + 1.0)/2.0)*127.0 + 0.5;
+	send_str[0] = get_address(m.label);
+	checksum += get_address(m.label);
+	
+	if(1 == m.channel)
+	{
+		send_str[1] = CMD_DRIVE_M1;
+		checksum += CMD_DRIVE_M1;
+	}
+	else if(2 == m.channel)
+	{
+		send_str[1] = CMD_DRIVE_M2;
+		checksum += CMD_DRIVE_M2;
+	}
+	else
+	{
+		ROS_WARN("Unsupported Channel selected in drive_motor_pwm.");
+		return;
+	}
+	send_str[2] = pwm;
+	checksum += pwm;
+
+	send_str[3] = checksum & 0x7F;
+	send_cmd(fd,send_str,4);
+	tcflush(fd, TCIOFLUSH); 
+}
+
+void drive_motor(int fd, struct mapping m)
 {	
 	unsigned char send_str[7];
-	int pps = get_pps(velocity);
+	int pps = get_pps(m.velocity,m.counts_per_rev);
 	int checksum = 0;
 
 	send_str[0] = get_address(m.label);
@@ -119,6 +168,7 @@ void drive_motor(int fd, struct mapping m, double velocity)
 	checksum +=   pps & 0xFF;
 
 	send_str[6] = checksum & 0x7F;
+	send_str[6] |= 0x80;
 	send_cmd(fd,send_str,7);
 
 	tcflush(fd, TCIOFLUSH); 
@@ -186,14 +236,15 @@ void set_pid_constants(unsigned char address, unsigned char cmd, int qpps, int p
 	tcflush(fd, TCIOFLUSH);
 }
 
-//The number of encoder ticks per revolution may vary per motor
-int get_pps(double vel)
+//From Rad/s, get the pps speed the motor controller expects from
+//most of the drive commands
+int get_pps(double velocity, int counts_per_rev)
 {
-	//vel is in rad/s
+	//velocity is in rad/s
 	//We know we have 420 ticks per rev*4 pulses per tick
 	//2*Pi rads in a rev
-	int pps = (vel*420*4)/(2*M_PI);
-	ROS_INFO("PPS: %d",pps);
+	//int pps = (velocity*420*4)/(2*M_PI);
+	int pps = (velocity*counts_per_rev*4)/(2*M_PI);
 	return pps;
 }
 
@@ -239,25 +290,15 @@ unsigned char mode_to_address(int mode)
 	return 0;
 }*/
 
-int main(int argc, char **argv)
+bool get_parameters(ros::NodeHandle nh_priv, std::string &port)
 {
-	//char port_name[100] = "/dev/ttySAC0";
-	ros::init(argc, argv, "orion_roboclaw_driver_node");
-	ros::NodeHandle n;
-	ros::NodeHandle nh_priv( "~" );
-	
-	//Publish commands at 50Hz
-	ros::Rate loop_rate(10);
-
-	//set up a subscriber to listen for joint_trajectory messages
-	ros::Subscriber joint_trajectory_sub = n.subscribe("cmd_joint_traj", 1, joint_trajectory_callback);
-
-	std::string port;
-	//check for non-detault port name
 	nh_priv.param("port",port,(const std::string)"/dev/ttySAC0");
-
+	nh_priv.param("closed_loop_control",closed_loop_mode,true);
+	
 	//Thank you Matt Richard for this XmlRpcValue nonsense code. Never would have figured this
 	//out on my own
+	
+	//Get all the joint names from the config file
 	XmlRpc::XmlRpcValue name_list;
 	if( nh_priv.getParam("names", name_list ) )
 	{
@@ -277,6 +318,8 @@ int main(int argc, char **argv)
 			address_map.push_back(m);
 		}
 	}
+	
+	//Get all the modes
 	XmlRpc::XmlRpcValue mode_list;
 	if( nh_priv.getParam("modes", mode_list ) )
 	{
@@ -299,6 +342,8 @@ int main(int argc, char **argv)
 			address_map[i].mode = static_cast<int>( mode_array[i] );
 		}
 	}
+
+	//Get all the channels
 	XmlRpc::XmlRpcValue channel_list;
 	if( nh_priv.getParam("channels", channel_list ) )
 	{
@@ -321,14 +366,157 @@ int main(int argc, char **argv)
 			address_map[i].channel = static_cast<int>( channel_array[i] );
 		}
 	}
+
+	//Get all the counts_per_rev
+	XmlRpc::XmlRpcValue counts_per_rev_list;
+	if( nh_priv.getParam("counts_per_rev", counts_per_rev_list ) )
+	{
+		ROS_ASSERT( counts_per_rev_list.getType( ) == XmlRpc::XmlRpcValue::TypeArray );
+
+		// Get channel array
+		XmlRpcValueAccess counts_per_rev_array_access( counts_per_rev_list );
+		XmlRpc::XmlRpcValue::ValueArray counts_per_rev_array = counts_per_rev_array_access.getValueArray( );
+		
+		if(counts_per_rev_array.size() > address_map.size())
+			ROS_WARN("More counts_per_rev arguments than joint names detected. Excess will be ignored.");
+		if(counts_per_rev_array.size() < address_map.size())
+		{
+			address_map.resize(counts_per_rev_array.size());
+			ROS_WARN("Less counts_per_rev than joint names detected. Extra joint names will be discarded.");
+		}
+		// Parse the joint names and verify the joint exists
+		for( unsigned int i = 0; i < address_map.size( ); i++ )
+		{
+			address_map[i].counts_per_rev = static_cast<int>( counts_per_rev_array[i] );
+		}
+	}
+
+	//Get all the P gains
+	XmlRpc::XmlRpcValue p_gain_list;
+	if( nh_priv.getParam("p_gain", p_gain_list ) )
+	{
+		ROS_ASSERT( p_gain_list.getType( ) == XmlRpc::XmlRpcValue::TypeArray );
+
+		// Get channel array
+		XmlRpcValueAccess p_gain_array_access( channel_list );
+		XmlRpc::XmlRpcValue::ValueArray p_gain_array = p_gain_array_access.getValueArray( );
+		
+		if(p_gain_array.size() > address_map.size())
+			ROS_WARN("More p_gain arguments than joint names detected. Excess will be ignored.");
+		if(p_gain_array.size() < address_map.size())
+		{
+			address_map.resize(p_gain_array.size());
+			ROS_WARN("Less p_gain than joint names detected. Extra joint names will be discarded.");
+		}
+		// Parse the joint names and verify the joint exists
+		for( unsigned int i = 0; i < address_map.size( ); i++ )
+		{
+			address_map[i].p_gain = static_cast<int>( p_gain_array[i] );
+			ROS_INFO("p_gain[i]: %d",address_map[i].p_gain);
+		}
+	}
 	
-	int count = 0;
+	//Get all the i gains
+	XmlRpc::XmlRpcValue i_gain_list;
+	if( nh_priv.getParam("i_gain", i_gain_list ) )
+	{
+		ROS_ASSERT( i_gain_list.getType( ) == XmlRpc::XmlRpcValue::TypeArray );
+
+		// Get channel array
+		XmlRpcValueAccess i_gain_array_access( channel_list );
+		XmlRpc::XmlRpcValue::ValueArray i_gain_array = i_gain_array_access.getValueArray( );
+		
+		if(i_gain_array.size() > address_map.size())
+			ROS_WARN("More i_gain arguments than joint names detected. Excess will be ignored.");
+		if(i_gain_array.size() < address_map.size())
+		{
+			address_map.resize(i_gain_array.size());
+			ROS_WARN("Less i_gain than joint names detected. Extra joint names will be discarded.");
+		}
+		// Parse the joint names and verify the joint exists
+		for( unsigned int i = 0; i < address_map.size( ); i++ )
+		{
+			address_map[i].i_gain = static_cast<int>( i_gain_array[i] );
+		}
+	}
+
+	//Get all the d gains
+	XmlRpc::XmlRpcValue d_gain_list;
+	if( nh_priv.getParam("d_gain", d_gain_list ) )
+	{
+		ROS_ASSERT( d_gain_list.getType( ) == XmlRpc::XmlRpcValue::TypeArray );
+
+		// Get channel array
+		XmlRpcValueAccess d_gain_array_access( channel_list );
+		XmlRpc::XmlRpcValue::ValueArray d_gain_array = d_gain_array_access.getValueArray( );
+		
+		if(d_gain_array.size() > address_map.size())
+			ROS_WARN("More d_gain arguments than joint names detected. Excess will be ignored.");
+		if(d_gain_array.size() < address_map.size())
+		{
+			address_map.resize(d_gain_array.size());
+			ROS_WARN("Less d_gain than joint names detected. Extra joint names will be discarded.");
+		}
+		// Parse the joint names and verify the joint exists
+		for( unsigned int i = 0; i < address_map.size( ); i++ )
+		{
+			address_map[i].d_gain = static_cast<int>( d_gain_array[i] );
+		}
+	}
+	
+	//Get all the qpps
+	XmlRpc::XmlRpcValue qpps_list;
+	if( nh_priv.getParam("max_encoder_counts_per_second", qpps_list ) )
+	{
+		ROS_ASSERT( qpps_list.getType( ) == XmlRpc::XmlRpcValue::TypeArray );
+
+		// Get channel array
+		XmlRpcValueAccess qpps_array_access( channel_list );
+		XmlRpc::XmlRpcValue::ValueArray qpps_array = qpps_array_access.getValueArray( );
+		
+		if(qpps_array.size() > address_map.size())
+			ROS_WARN("More qpps arguments than joint names detected. Excess will be ignored.");
+		if(qpps_array.size() < address_map.size())
+		{
+			address_map.resize(qpps_array.size());
+			ROS_WARN("Less qpps than joint names detected. Extra joint names will be discarded.");
+		}
+		// Parse the joint names and verify the joint exists
+		for( unsigned int i = 0; i < address_map.size( ); i++ )
+		{
+			address_map[i].qpps = static_cast<int>( qpps_array[i] );
+		}
+	}
+}
+
+int main(int argc, char **argv)
+{
+	ros::init(argc, argv, "orion_roboclaw_driver_node");
+	ros::NodeHandle n;
+	ros::NodeHandle nh_priv( "~" );
+	
+	//Publish commands at 50Hz
+	ros::Rate loop_rate(10);
+
+	//set up a subscriber to listen for joint_trajectory messages
+	ros::Subscriber joint_trajectory_sub = n.subscribe("cmd_joint_traj", 1, joint_trajectory_callback);
+
+	std::string port;
+	
+	//Get all the parameters. All but port are global
+	//Most are in the address_map
+	get_parameters(nh_priv,port);
+
+	
 	fd = open_serial_port(port.c_str());
 	if(fd < 0)
 		return 0;
 	//stop all the motors
 	for( int i = 0; i < address_map.size(); i++)
-		drive_motor(fd,address_map[i],0);
+	{
+		address_map[i].velocity = 0;
+		drive_motor(fd,address_map[i]);
+	}
 
 	//this needs to be replaced with params, but these defaults 
 	//work for mecanum	
@@ -341,17 +529,18 @@ int main(int argc, char **argv)
 	set_pid_constants(129,28,2400,0x100,0x10,0x0);
 	usleep(10000);
 	
+	unsigned char rec_str[100];
+	int bytes_read;
 	while (ros::ok())
 	{
-		loop_rate.sleep();
-		//Send current command
-		for(int i = 0; i < address_map.size(); i++)
-			drive_motor(fd,address_map[i],address_map[i].vel);
-		ros::spinOnce();
+		ros::spin();
 	}
 	//stop all the motors
 	for( int i = 0; i < address_map.size(); i++)
-		drive_motor(fd,address_map[i],0);
+	{
+		address_map[i].velocity = 0;
+		drive_motor(fd,address_map[i]);
+	}
 	return 0;
 }
 
